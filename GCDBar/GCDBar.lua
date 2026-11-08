@@ -369,6 +369,8 @@ events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 events:RegisterEvent("PLAYER_ENTERING_WORLD")
 events:RegisterEvent("SPELL_UPDATE_COOLDOWN")
+events:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
+events:RegisterEvent("UNIT_SPELLCAST_FAILED")
 
 events:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
@@ -398,5 +400,9 @@ events:SetScript("OnEvent", function(self, event, arg1)
         ClearBar()
     elseif event == "SPELL_UPDATE_COOLDOWN" then
         UpdateGCD()
+    elseif event == "UNIT_SPELLCAST_INTERRUPTED" or event == "UNIT_SPELLCAST_FAILED" then
+        if arg1 == "player" then
+            UpdateGCD()
+        end
     end
 end)

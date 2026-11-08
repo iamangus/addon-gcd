@@ -85,8 +85,8 @@ git push origin v1.0.0
 ```
 
 It copies `GCDBar/`, writes the tag version into both TOC files, zips it as
-`GCDBar-1.0.0-forever.zip`, and attaches the zip and a `release.json` metadata
-file to the GitHub release.
+`GCDBar-<version>-forever.zip`, and attaches the zip and a `release.json`
+metadata file to the GitHub release.
 
 ## License
 
