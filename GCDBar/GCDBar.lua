@@ -60,6 +60,10 @@ local lastBaseSpellID
 local lastCategory
 local lastStartRecoveryCategory
 local lastItemID
+local playerCastWindowEnd = 0
+local lastEventSpellID
+local lastEventRecovery
+local lastEventAccepted = false
 
 local function IsSecret(value)
     return type(issecretvalue) == "function" and issecretvalue(value) or false
@@ -212,6 +216,25 @@ local function GetCooldownInfo(spellID)
         return nil
     end
     return C_Spell.GetSpellCooldown(safeSpellID)
+end
+
+local function IsKnownPlayerSpell(spellID)
+    if not spellID then
+        return false
+    end
+
+    if spellID == lastSpellID and GetTime() <= playerCastWindowEnd then
+        return true
+    end
+
+    if type(C_SpellBook) == "table" and type(C_SpellBook.FindSpellBookSlotForSpell) == "function" then
+        local ok, slot = pcall(C_SpellBook.FindSpellBookSlotForSpell, spellID)
+        if ok and slot ~= nil then
+            return true
+        end
+    end
+
+    return false
 end
 
 local function StartGCDFromRemaining(remaining, fromFallback)
@@ -694,11 +717,15 @@ end
 
 local function PrintDebug()
     Print("in combat: " .. tostring(InCombatLockdown()))
-    Print("last spell: " .. Describe(lastSpellID)
+    Print("last event spell: " .. Describe(lastEventSpellID)
+        .. " recovery: " .. Describe(lastEventRecovery)
+        .. " accepted: " .. tostring(lastEventAccepted))
+    Print("last player spell: " .. Describe(lastSpellID)
         .. " base: " .. Describe(lastBaseSpellID)
         .. " category: " .. Describe(lastCategory)
         .. " startRecovery: " .. Describe(lastStartRecoveryCategory)
         .. " item: " .. Describe(lastItemID))
+    Print(string.format("player cast window: %.2fs", playerCastWindowEnd - GetTime()))
     Print("global recovery category: " .. tostring(GLOBAL_RECOVERY_CATEGORY))
 
     local info = GetCooldownInfo(lastSpellID or lastBaseSpellID)
@@ -795,13 +822,28 @@ SlashCmdList.GCDBAR = HandleCommand
 local function OnSpellUpdateCooldown(spellID, baseSpellID, category, startRecoveryCategory, itemID)
     local safeSpellID = SafeValue(spellID)
     local safeBaseSpellID = SafeValue(baseSpellID)
+    local safeItemID = SafeValue(itemID)
     local recovery = SafeValue(startRecoveryCategory)
+    local candidate = safeSpellID or safeBaseSpellID
 
-    lastSpellID = safeSpellID or safeBaseSpellID or lastSpellID
+    lastEventSpellID = candidate
+    lastEventRecovery = recovery
+
+    -- SPELL_UPDATE_COOLDOWN is global, so pet spells arrive here too. Only
+    -- accept the player's own spells, or an item use (pets do not use items).
+    local isPlayer = safeItemID ~= nil or IsKnownPlayerSpell(candidate)
+    lastEventAccepted = isPlayer
+
+    if not isPlayer then
+        return
+    end
+
+    lastSpellID = candidate or lastSpellID
     lastBaseSpellID = safeBaseSpellID or lastBaseSpellID
+    playerCastWindowEnd = GetTime() + 0.75
     lastCategory = SafeValue(category)
     lastStartRecoveryCategory = recovery
-    lastItemID = SafeValue(itemID)
+    lastItemID = safeItemID
 
     if recovery == GLOBAL_RECOVERY_CATEGORY then
         TryStartGCD(lastSpellID, true)
@@ -863,10 +905,11 @@ events:SetScript("OnEvent", function(self, event, ...)
     elseif event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_SUCCEEDED"
         or event == "UNIT_SPELLCAST_CHANNEL_START" then
         local unit, _, spellID = ...
-        if unit == "player" then
+        if unit == "player" or unit == "vehicle" then
             local safeSpellID = SafeValue(spellID)
             if safeSpellID then
                 lastSpellID = safeSpellID
+                playerCastWindowEnd = GetTime() + 0.75
             end
         end
     elseif event == "UNIT_SPELLCAST_INTERRUPTED" or event == "UNIT_SPELLCAST_FAILED" then

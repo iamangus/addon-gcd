@@ -98,8 +98,8 @@ estimate. The bar keeps working in combat and in instances.
 The addon lives in `GCDBar/`. The release workflow runs on tags matching `v*`:
 
 ```sh
-git tag v1.3.0
-git push origin v1.3.0
+git tag v1.3.1
+git push origin v1.3.1
 ```
 
 It copies `GCDBar/`, writes the tag version into both TOC files, zips it as
