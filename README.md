@@ -2,15 +2,15 @@
 
 A small, movable global cooldown bar for **World of Warcraft: Forever**.
 
-The bar tracks your GCD using Blizzard's dummy Global Cooldown spell (`61304`).
-It is driven by `C_Spell.GetSpellCooldownDuration` and
-`StatusBar:SetTimerDuration`, so it keeps animating in combat where cooldown
-values can be secret.
+It uses the same background, border, fill, pip, and label art as Forever's
+built-in main-hand, off-hand, and ranged swing timers.
 
 - No dependencies.
-- Class-colored fill by default.
-- Position, size, and scale are saved per account.
+- Three fill styles: main hand, off hand, or ranged.
+- Remaining-time readout, like the swing timers.
+- Position, size, scale, opacity, and style are saved per account.
 - Click-through while locked.
+- Keeps working in combat by reading the never-secret GCD dummy spell.
 
 ## Install with WowUp
 
@@ -47,27 +47,34 @@ selects it for the Forever client.
 | --- | --- |
 | `/gcd` | Toggle move mode. Drag the bar, then use `/gcd` again to lock it. |
 | `/gcd lock` | Lock the bar and make it click-through. |
-| `/gcd reset` | Reset position, size, scale, and color. |
-| `/gcd width <60-800>` | Set the bar width in pixels. |
-| `/gcd height <4-60>` | Set the bar height in pixels. |
-| `/gcd scale <0.5-3>` | Scale the whole bar. |
-| `/gcd color <rrggbb>` | Set a custom fill color, for example `/gcd color ff8800`. |
-| `/gcd class` | Go back to your class color. |
+| `/gcd reset` | Reset position, size, scale, opacity, and style. |
+| `/gcd width <120-852>` | Set the bar width in pixels. |
+| `/gcd height <15-60>` | Set the bar height in pixels. |
+| `/gcd scale <0.5-2>` | Scale the whole bar. |
+| `/gcd opacity <10-100>` | Set opacity as a percentage. |
+| `/gcd style <mainhand\|offhand\|ranged>` | Pick which swing-timer fill to use. |
 | `/gcd test` | Preview the bar for 1.5 seconds. |
+| `/gcd debug` | Print the current GCD API state for troubleshooting. |
 
-The default is a 240 × 16 bar centered 160 pixels below the middle of the
-screen.
+The default is the 213 × 15 bar from the Modern swing-timer preset, using the
+main-hand fill at full opacity. Forever's swing timers default to 50% opacity;
+use `/gcd opacity 50` if you want them to match exactly.
 
 ## How it works
 
 The GCD is read from spell `61304`, Blizzard's dummy Global Cooldown spell.
-`C_Spell.GetSpellCooldownDuration(61304)` returns an opaque duration object.
-`StatusBar:SetTimerDuration` consumes it and animates the fill without the
-addon ever reading the timing numbers. That is the supported pattern for
-displaying time-based combat data under Forever's secret-value rules.
+That spell is on Blizzard's never-secret cooldown whitelist, so the addon can
+read its start time and duration even in combat.
 
-There is a numeric fallback for clients that do not expose the duration-object
-API.
+The bar polls that cooldown on a short ticker instead of relying only on
+`SPELL_UPDATE_COOLDOWN` timing, then animates exactly like Blizzard's swing
+timer: the bar fills from 0 to 1 while the time label counts down. The
+background, border, fill, pip, and label atlases are the same ones used by
+`Blizzard_SwingTimer`.
+
+If a client ever marks those values secret, the addon falls back to
+`C_Spell.GetSpellCooldownDuration` plus `StatusBar:SetTimerDuration` and hides
+the numeric readout.
 
 ## Compatibility
 
@@ -80,8 +87,8 @@ API.
 The addon lives in `GCDBar/`. The release workflow runs on tags matching `v*`:
 
 ```sh
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 It copies `GCDBar/`, writes the tag version into both TOC files, zips it as

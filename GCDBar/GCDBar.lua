@@ -1,14 +1,17 @@
 local addonName = ...
 
--- Spell 61304 is Blizzard's dummy "Global Cooldown" spell. Its cooldown is
--- flagged never-secret, and GetSpellCooldownDuration returns the current GCD
--- as an opaque duration object, so the bar keeps working in combat.
+-- Blizzard's dummy "Global Cooldown" spell. Its cooldown is whitelisted as
+-- never-secret, which lets an addon read the start/duration and animate a bar
+-- the same way Blizzard's own swing timers do.
 local GCD_SPELL_ID = 61304
+local POLL_INTERVAL = 0.05
 
 local DEFAULTS = {
-    width = 240,
-    height = 16,
+    width = 213,
+    height = 15,
     scale = 1,
+    alpha = 1,
+    style = "mainhand",
     locked = true,
     point = "CENTER",
     relativePoint = "CENTER",
@@ -16,22 +19,48 @@ local DEFAULTS = {
     y = -160,
 }
 
-local DB_VERSION = 1
+local DB_VERSION = 2
+
+local STYLE_TEXTURES = {
+    mainhand = "ui-swingtimerbar-filling-mainhand",
+    offhand = "ui-swingtimerbar-filling-offhand",
+    ranged = "ui-swingtimerbar-filling-ranged",
+}
 
 local db
 local bar
 local status
-local overlay
-local overlayText
-local useDuration
-local fallbackStart
-local fallbackDuration
+local pip
+local typeLabel
+local typeLabelShadow
+local timeLabel
+local moveFrame
+
+local gcdActive = false
+local gcdStartTime
+local gcdDuration
+local gcdEndTime
+local useDurationTimer = false
+local isTest = false
+local restartBlockedUntil = 0
+local pollElapsed = 0
 
 local HAS_DURATION_API = type(C_Spell) == "table"
     and type(C_Spell.GetSpellCooldownDuration) == "function"
 
 local INTERPOLATION = (Enum and Enum.StatusBarInterpolation and Enum.StatusBarInterpolation.Immediate) or 0
-local DIRECTION = (Enum and Enum.StatusBarTimerDirection and Enum.StatusBarTimerDirection.RemainingTime) or 1
+local ELAPSED_DIRECTION = (Enum and Enum.StatusBarTimerDirection and Enum.StatusBarTimerDirection.ElapsedTime) or 0
+
+local function IsSecret(value)
+    return type(issecretvalue) == "function" and issecretvalue(value) or false
+end
+
+local function Describe(value)
+    if IsSecret(value) then
+        return "secret"
+    end
+    return tostring(value)
+end
 
 local function Print(message)
     print("|cff33ff99GCD Bar|r: " .. tostring(message))
@@ -50,28 +79,6 @@ local function CopyDefaults(destination, source)
     end
 end
 
-local function GetClassColor()
-    local _, class = UnitClass("player")
-    local color = class and RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
-    if color then
-        return color.r, color.g, color.b
-    end
-    return 0.20, 0.85, 0.90
-end
-
-local function UpdateColor()
-    if not status then
-        return
-    end
-
-    local custom = db and db.customColor
-    if custom then
-        status:SetStatusBarColor(custom.r, custom.g, custom.b)
-    else
-        status:SetStatusBarColor(GetClassColor())
-    end
-end
-
 local function ApplyPosition()
     if not bar then
         return
@@ -87,77 +94,226 @@ local function ApplyPosition()
     )
 end
 
-local function ClearBar()
+local function UpdateShadowWidth()
+    if typeLabelShadow then
+        typeLabelShadow:SetWidth(math.min(171, math.max(1, (db.width or DEFAULTS.width) - 12)))
+    end
+end
+
+local function ApplyStyle()
     if not status then
         return
     end
 
-    -- SetMinMaxValues also removes any duration-object timer.
+    local texture = STYLE_TEXTURES[db.style] or STYLE_TEXTURES[DEFAULTS.style]
+    status:SetStatusBarTexture(texture)
+
+    local statusBarTexture = status:GetStatusBarTexture()
+    if pip and statusBarTexture then
+        pip:ClearAllPoints()
+        pip:SetPoint("RIGHT", statusBarTexture, "RIGHT", 0, 0)
+    end
+end
+
+local function ApplySize()
+    if not bar then
+        return
+    end
+    bar:SetSize(db.width, db.height)
+    UpdateShadowWidth()
+end
+
+local function ClearGCD()
+    gcdActive = false
+    useDurationTimer = false
+    isTest = false
+    gcdStartTime = nil
+    gcdDuration = nil
+    gcdEndTime = nil
+    restartBlockedUntil = GetTime() + POLL_INTERVAL
+
+    if not status then
+        return
+    end
+
+    -- Removing the range also removes any duration-object timer.
     status:SetMinMaxValues(0, 1)
     status:SetValue(0)
+
+    if pip then
+        pip:Hide()
+    end
+    if timeLabel then
+        timeLabel:SetText("0.0")
+        timeLabel:Show()
+    end
 end
 
-local function OnFallbackUpdate()
-    if not fallbackStart or not fallbackDuration then
+local function GetGCDInfo()
+    if type(C_Spell) ~= "table" or type(C_Spell.GetSpellCooldown) ~= "function" then
+        return nil
+    end
+    return C_Spell.GetSpellCooldown(GCD_SPELL_ID)
+end
+
+local function IsGCDActive(info)
+    if not info then
+        return false
+    end
+
+    if info.isActive ~= nil then
+        return info.isActive
+    end
+
+    local duration = info.duration
+    if duration ~= nil and not IsSecret(duration) then
+        return duration > 0
+    end
+
+    return false
+end
+
+local function StartGCDDuration()
+    if not HAS_DURATION_API or type(status.SetTimerDuration) ~= "function" then
+        return false
+    end
+
+    local durationObject = C_Spell.GetSpellCooldownDuration(GCD_SPELL_ID)
+    if not durationObject then
+        return false
+    end
+
+    status:SetMinMaxValues(0, 1)
+    local ok = pcall(status.SetTimerDuration, status, durationObject, INTERPOLATION, ELAPSED_DIRECTION)
+    if not ok then
+        return false
+    end
+
+    gcdActive = true
+    useDurationTimer = true
+    isTest = false
+    gcdStartTime = nil
+    gcdDuration = nil
+    gcdEndTime = nil
+
+    if pip then
+        pip:Show()
+    end
+    if timeLabel then
+        -- Duration objects cannot be read, so there is no number to show.
+        timeLabel:Hide()
+    end
+    return true
+end
+
+local function StartGCD(info)
+    if not info then
+        return false
+    end
+
+    local startTime, duration = info.startTime, info.duration
+    if IsSecret(startTime) or IsSecret(duration) then
+        return StartGCDDuration()
+    end
+
+    if not startTime or not duration or duration <= 0 then
+        return false
+    end
+
+    local endTime = startTime + duration
+    if endTime <= GetTime() then
+        return false
+    end
+
+    gcdActive = true
+    useDurationTimer = false
+    isTest = false
+    gcdStartTime = startTime
+    gcdDuration = duration
+    gcdEndTime = endTime
+
+    status:SetMinMaxValues(0, 1)
+    local remaining = math.max(0, gcdEndTime - GetTime())
+    status:SetValue(math.max(0, math.min(1, (duration - remaining) / duration)))
+    if pip then
+        pip:Show()
+    end
+    if timeLabel then
+        timeLabel:Show()
+        timeLabel:SetFormattedText("%.1f", remaining)
+    end
+    return true
+end
+
+local function PollGCD(force)
+    if not bar then
         return
     end
 
-    local remaining = fallbackStart + fallbackDuration - GetTime()
+    local info = GetGCDInfo()
+    local active = IsGCDActive(info)
+
+    if isTest then
+        if active then
+            -- A real GCD interrupted the preview.
+            isTest = false
+            gcdActive = false
+        else
+            return
+        end
+    end
+
+    if active then
+        if not gcdActive and (force or GetTime() >= restartBlockedUntil) then
+            if not StartGCD(info) then
+                ClearGCD()
+            end
+        end
+    elseif gcdActive then
+        ClearGCD()
+    end
+end
+
+local function StartTest()
+    local now = GetTime()
+    isTest = true
+    gcdActive = true
+    useDurationTimer = false
+    gcdStartTime = now
+    gcdDuration = 1.5
+    gcdEndTime = now + 1.5
+
+    status:SetMinMaxValues(0, 1)
+    status:SetValue(0)
+    if pip then
+        pip:Show()
+    end
+    if timeLabel then
+        timeLabel:Show()
+        timeLabel:SetFormattedText("%.1f", 1.5)
+    end
+end
+
+local function OnUpdate(_, elapsed)
+    pollElapsed = pollElapsed + elapsed
+    if pollElapsed >= POLL_INTERVAL then
+        pollElapsed = 0
+        PollGCD(false)
+    end
+
+    if not gcdActive or useDurationTimer or not gcdEndTime then
+        return
+    end
+
+    local remaining = gcdEndTime - GetTime()
     if remaining <= 0 then
-        fallbackStart = nil
-        fallbackDuration = nil
-        status:SetValue(0)
-    else
-        status:SetValue(remaining / fallbackDuration)
-    end
-end
-
-local function UpdateGCD()
-    if not bar then
+        ClearGCD()
         return
     end
 
-    if useDuration then
-        local duration = C_Spell.GetSpellCooldownDuration(GCD_SPELL_ID)
-        if duration then
-            status:SetTimerDuration(duration, INTERPOLATION, DIRECTION)
-            return
-        end
-    elseif C_Spell and C_Spell.GetSpellCooldown then
-        local info = C_Spell.GetSpellCooldown(GCD_SPELL_ID)
-        if info and info.startTime and info.duration and info.duration > 0 then
-            fallbackStart = info.startTime
-            fallbackDuration = info.duration
-            local remaining = fallbackStart + fallbackDuration - GetTime()
-            status:SetValue(math.max(0, math.min(1, remaining / fallbackDuration)))
-            return
-        end
-    end
-
-    fallbackStart = nil
-    fallbackDuration = nil
-    ClearBar()
-end
-
-local function ShowTest()
-    if not bar then
-        return
-    end
-
-    if useDuration then
-        if type(C_DurationUtil) ~= "table" or type(C_DurationUtil.CreateDuration) ~= "function" then
-            Print("this client cannot create a preview duration.")
-            return
-        end
-
-        local duration = C_DurationUtil.CreateDuration()
-        duration:SetTimeFromStart(GetTime(), 1.5)
-        status:SetTimerDuration(duration, INTERPOLATION, DIRECTION)
-    else
-        fallbackStart = GetTime()
-        fallbackDuration = 1.5
-        status:SetMinMaxValues(0, 1)
-        status:SetValue(1)
+    status:SetValue((gcdDuration - remaining) / gcdDuration)
+    if timeLabel then
+        timeLabel:SetFormattedText("%.1f", remaining)
     end
 end
 
@@ -171,56 +327,73 @@ local function SetMoveMode(enabled)
 
     if enabled then
         bar:RegisterForDrag("LeftButton")
-        overlay:Show()
+        moveFrame:Show()
     else
-        overlay:Hide()
+        moveFrame:Hide()
     end
 end
 
 local function CreateBar()
-    bar = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
+    bar = CreateFrame("Frame", nil, UIParent)
     bar:SetSize(db.width, db.height)
     bar:SetFrameStrata("MEDIUM")
     bar:SetFrameLevel(100)
     bar:SetClampedToScreen(true)
     bar:SetMovable(true)
-    bar:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
-        edgeFile = "Interface\\Buttons\\WHITE8X8",
-        edgeSize = 1,
-    })
-    bar:SetBackdropColor(0, 0, 0, 0.60)
-    bar:SetBackdropBorderColor(0, 0, 0, 0.90)
+    bar:SetAlpha(db.alpha)
+
+    -- The same atlas art as Blizzard's swing timers.
+    local background = bar:CreateTexture(nil, "BACKGROUND")
+    background:SetAtlas("ui-swingtimerbar-background")
+    background:SetAllPoints(bar)
+
+    local border = bar:CreateTexture(nil, "BACKGROUND")
+    border:SetAtlas("ui-swingtimerbar-frame")
+    border:SetAllPoints(bar)
 
     status = CreateFrame("StatusBar", nil, bar)
-    status:SetPoint("TOPLEFT", bar, "TOPLEFT", 1, -1)
-    status:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT", -1, 1)
-    status:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+    status:SetPoint("TOPLEFT", bar, "TOPLEFT", 5, -4)
+    status:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT", -5, 4)
     status:SetMinMaxValues(0, 1)
     status:SetValue(0)
     status:SetFrameLevel(bar:GetFrameLevel() + 1)
 
-    useDuration = HAS_DURATION_API and type(status.SetTimerDuration) == "function"
-    if not useDuration then
-        bar:SetScript("OnUpdate", OnFallbackUpdate)
-    end
+    pip = status:CreateTexture(nil, "OVERLAY")
+    pip:SetAtlas("ui-swingtimerbar-pip", true)
+    pip:Hide()
 
-    overlay = CreateFrame("Frame", nil, bar, "BackdropTemplate")
-    overlay:SetAllPoints()
-    overlay:SetFrameLevel(bar:GetFrameLevel() + 10)
-    overlay:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
+    typeLabelShadow = status:CreateTexture(nil, "OVERLAY")
+    typeLabelShadow:SetAtlas("ui-swingtimerbar-textshadow-left")
+    typeLabelShadow:SetPoint("TOPLEFT")
+    typeLabelShadow:SetPoint("BOTTOMLEFT")
+
+    typeLabel = status:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    typeLabel:SetJustifyH("LEFT")
+    typeLabel:SetPoint("LEFT", 10, 0)
+    typeLabel:SetText("GCD")
+
+    timeLabel = status:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    timeLabel:SetJustifyH("RIGHT")
+    timeLabel:SetPoint("RIGHT", -10, 0)
+    timeLabel:SetText("0.0")
+
+    ApplyStyle()
+    UpdateShadowWidth()
+
+    moveFrame = CreateFrame("Frame", nil, bar, "BackdropTemplate")
+    moveFrame:SetAllPoints(bar)
+    moveFrame:SetFrameLevel(bar:GetFrameLevel() + 10)
+    moveFrame:SetBackdrop({
         edgeFile = "Interface\\Buttons\\WHITE8X8",
         edgeSize = 1,
     })
-    overlay:SetBackdropColor(0, 0, 0, 0.35)
-    overlay:SetBackdropBorderColor(1, 0.82, 0, 1)
+    moveFrame:SetBackdropBorderColor(1, 0.82, 0, 1)
+    moveFrame:Hide()
 
-    overlayText = overlay:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    overlayText:SetPoint("CENTER", overlay, "CENTER", 0, 0)
-    overlayText:SetText("Drag to move")
-    overlayText:SetTextColor(1, 0.82, 0, 1)
-    overlay:Hide()
+    local moveText = moveFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    moveText:SetPoint("BOTTOM", moveFrame, "TOP", 0, 4)
+    moveText:SetText("Drag to move  -  /gcd to lock")
+    moveText:SetTextColor(1, 0.82, 0, 1)
 
     bar:SetScript("OnDragStart", function(self)
         if db.locked then
@@ -239,9 +412,9 @@ local function CreateBar()
         db.y = y
     end)
 
+    bar:SetScript("OnUpdate", OnUpdate)
+
     ApplyPosition()
-    bar:SetScale(db.scale)
-    UpdateColor()
     SetMoveMode(not db.locked)
 end
 
@@ -249,31 +422,35 @@ local function ResetSettings()
     db.width = DEFAULTS.width
     db.height = DEFAULTS.height
     db.scale = DEFAULTS.scale
+    db.alpha = DEFAULTS.alpha
+    db.style = DEFAULTS.style
     db.point = DEFAULTS.point
     db.relativePoint = DEFAULTS.relativePoint
     db.x = DEFAULTS.x
     db.y = DEFAULTS.y
-    db.customColor = nil
     db.locked = true
 
-    bar:SetSize(db.width, db.height)
+    ApplySize()
     bar:SetScale(db.scale)
+    bar:SetAlpha(db.alpha)
+    ApplyStyle()
     ApplyPosition()
-    UpdateColor()
     SetMoveMode(false)
+    ClearGCD()
 end
 
 local function PrintHelp()
     Print("commands:")
     Print("  /gcd - toggle move mode")
     Print("  /gcd lock - lock the bar")
-    Print("  /gcd reset - reset position and size")
-    Print("  /gcd width <60-800> - set width")
-    Print("  /gcd height <4-60> - set height")
-    Print("  /gcd scale <0.5-3> - set scale")
-    Print("  /gcd color <rrggbb> - set a custom bar color")
-    Print("  /gcd class - use your class color")
+    Print("  /gcd reset - reset position, size, and style")
+    Print("  /gcd width <120-852> - set width")
+    Print("  /gcd height <15-60> - set height")
+    Print("  /gcd scale <0.5-2> - set scale")
+    Print("  /gcd opacity <10-100> - set opacity percentage")
+    Print("  /gcd style <mainhand|offhand|ranged> - set fill color")
     Print("  /gcd test - preview the bar")
+    Print("  /gcd debug - print GCD API state")
 end
 
 local function ParseNumber(value, minimum, maximum)
@@ -282,6 +459,30 @@ local function ParseNumber(value, minimum, maximum)
         return nil
     end
     return math.max(minimum, math.min(maximum, number))
+end
+
+local function PrintDebug()
+    Print("in combat: " .. tostring(InCombatLockdown()))
+
+    local info = GetGCDInfo()
+    if info then
+        Print("start=" .. Describe(info.startTime)
+            .. " duration=" .. Describe(info.duration)
+            .. " active=" .. Describe(info.isActive)
+            .. " onGCD=" .. Describe(info.isOnGCD))
+    else
+        Print("C_Spell.GetSpellCooldown(61304) returned nil")
+    end
+
+    local durationObject = HAS_DURATION_API and C_Spell.GetSpellCooldownDuration(GCD_SPELL_ID)
+    Print("duration object: " .. tostring(durationObject ~= nil))
+
+    if C_Secrets and C_Secrets.ShouldSpellCooldownBeSecret then
+        local ok, secret = pcall(C_Secrets.ShouldSpellCooldownBeSecret, GCD_SPELL_ID)
+        Print("cooldown secret: " .. (ok and Describe(secret) or "error"))
+    end
+
+    Print("tracking: " .. tostring(gcdActive) .. ", duration timer: " .. tostring(useDurationTimer))
 end
 
 local function HandleCommand(message)
@@ -309,53 +510,56 @@ local function HandleCommand(message)
         Print("locked.")
     elseif command == "reset" then
         ResetSettings()
-        Print("position and size reset.")
+        Print("position, size, and style reset.")
     elseif command == "width" then
-        local width = ParseNumber(rest, 60, 800)
+        local width = ParseNumber(rest, 120, 852)
         if width then
             db.width = width
-            bar:SetSize(db.width, db.height)
+            ApplySize()
             Print("width set to " .. width .. ".")
         else
-            Print("usage: /gcd width <60-800>")
+            Print("usage: /gcd width <120-852>")
         end
     elseif command == "height" then
-        local height = ParseNumber(rest, 4, 60)
+        local height = ParseNumber(rest, 15, 60)
         if height then
             db.height = height
-            bar:SetSize(db.width, db.height)
+            ApplySize()
             Print("height set to " .. height .. ".")
         else
-            Print("usage: /gcd height <4-60>")
+            Print("usage: /gcd height <15-60>")
         end
     elseif command == "scale" then
-        local scale = ParseNumber(rest, 0.5, 3)
+        local scale = ParseNumber(rest, 0.5, 2)
         if scale then
             db.scale = scale
             bar:SetScale(db.scale)
             Print("scale set to " .. scale .. ".")
         else
-            Print("usage: /gcd scale <0.5-3>")
+            Print("usage: /gcd scale <0.5-2>")
         end
-    elseif command == "color" then
-        local hex = rest:match("^#?(%x%x%x%x%x%x)$")
-        if hex then
-            db.customColor = {
-                r = tonumber(hex:sub(1, 2), 16) / 255,
-                g = tonumber(hex:sub(3, 4), 16) / 255,
-                b = tonumber(hex:sub(5, 6), 16) / 255,
-            }
-            UpdateColor()
-            Print("color set to #" .. hex:lower() .. ".")
+    elseif command == "opacity" then
+        local opacity = ParseNumber(rest, 10, 100)
+        if opacity then
+            db.alpha = opacity / 100
+            bar:SetAlpha(db.alpha)
+            Print("opacity set to " .. opacity .. "%.")
         else
-            Print("usage: /gcd color <rrggbb>")
+            Print("usage: /gcd opacity <10-100>")
         end
-    elseif command == "class" then
-        db.customColor = nil
-        UpdateColor()
-        Print("using your class color.")
+    elseif command == "style" then
+        local style = rest:lower()
+        if STYLE_TEXTURES[style] then
+            db.style = style
+            ApplyStyle()
+            Print("style set to " .. style .. ".")
+        else
+            Print("usage: /gcd style <mainhand|offhand|ranged>")
+        end
     elseif command == "test" then
-        ShowTest()
+        StartTest()
+    elseif command == "debug" then
+        PrintDebug()
     else
         PrintHelp()
     end
@@ -367,7 +571,6 @@ SlashCmdList.GCDBAR = HandleCommand
 
 local events = CreateFrame("Frame")
 events:RegisterEvent("ADDON_LOADED")
-events:RegisterEvent("PLAYER_LOGIN")
 events:RegisterEvent("PLAYER_ENTERING_WORLD")
 events:RegisterEvent("SPELL_UPDATE_COOLDOWN")
 events:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
@@ -382,6 +585,15 @@ events:SetScript("OnEvent", function(self, event, arg1)
         GCDBarDB = GCDBarDB or {}
         db = GCDBarDB
         CopyDefaults(db, DEFAULTS)
+
+        if (db.version or 0) < 2 then
+            -- Adopt the swing-timer dimensions and drop the old custom color.
+            db.width = DEFAULTS.width
+            db.height = DEFAULTS.height
+            db.alpha = DEFAULTS.alpha
+            db.style = DEFAULTS.style
+            db.customColor = nil
+        end
         db.version = DB_VERSION
 
         local firstRun = db.welcomed ~= true
@@ -393,17 +605,13 @@ events:SetScript("OnEvent", function(self, event, arg1)
         if firstRun then
             Print("loaded. Type /gcd to move the bar, or /gcd test to preview it.")
         end
-    elseif event == "PLAYER_LOGIN" then
-        UpdateColor()
     elseif event == "PLAYER_ENTERING_WORLD" then
-        fallbackStart = nil
-        fallbackDuration = nil
-        ClearBar()
+        ClearGCD()
     elseif event == "SPELL_UPDATE_COOLDOWN" then
-        UpdateGCD()
+        PollGCD(true)
     elseif event == "UNIT_SPELLCAST_INTERRUPTED" or event == "UNIT_SPELLCAST_FAILED" then
         if arg1 == "player" then
-            UpdateGCD()
+            PollGCD(true)
         end
     end
 end)
