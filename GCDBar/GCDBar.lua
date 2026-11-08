@@ -17,7 +17,6 @@ local DEFAULTS = {
     scale = 1,
     alpha = 1,
     style = "mainhand",
-    locked = true,
     point = "CENTER",
     relativePoint = "CENTER",
     x = 0,
@@ -39,7 +38,12 @@ local pip
 local typeLabel
 local typeLabelShadow
 local timeLabel
-local moveFrame
+local grip
+local highlight
+
+local clickEnabled = false
+local interacting = false
+local hovered = false
 
 local gcdActive = false
 local gcdDuration
@@ -134,6 +138,48 @@ local function ApplySize()
     end
     bar:SetSize(db.width, db.height)
     UpdateShadowWidth()
+end
+
+local function SavePosition()
+    if not bar then
+        return
+    end
+
+    local point, _, relativePoint, x, y = bar:GetPoint(1)
+    db.point = point
+    db.relativePoint = relativePoint
+    db.x = x
+    db.y = y
+end
+
+local function UpdateInteraction()
+    if not bar or not grip then
+        return
+    end
+
+    local over = hovered or bar:IsMouseOver() or status:IsMouseOver() or grip:IsMouseOver()
+    local shift = over and IsShiftKeyDown()
+
+    local show = over and shift
+    if show and not grip:IsShown() then
+        grip:Show()
+    elseif not show and grip:IsShown() and not interacting then
+        grip:Hide()
+    end
+
+    if highlight then
+        if show and not highlight:IsShown() then
+            highlight:Show()
+        elseif not show and highlight:IsShown() and not interacting then
+            highlight:Hide()
+        end
+    end
+
+    local wantClick = show or interacting
+    if bar.SetMouseClickEnabled and wantClick ~= clickEnabled then
+        clickEnabled = wantClick
+        bar:SetMouseClickEnabled(wantClick)
+    end
 end
 
 local function ClearGCD()
@@ -415,6 +461,8 @@ local function StartTest()
 end
 
 local function OnUpdate(_, elapsed)
+    UpdateInteraction()
+
     pollElapsed = pollElapsed + elapsed
     if pollElapsed >= POLL_INTERVAL then
         pollElapsed = 0
@@ -437,22 +485,6 @@ local function OnUpdate(_, elapsed)
     end
 end
 
-local function SetMoveMode(enabled)
-    if not bar then
-        return
-    end
-
-    db.locked = not enabled
-    bar:EnableMouse(enabled)
-
-    if enabled then
-        bar:RegisterForDrag("LeftButton")
-        moveFrame:Show()
-    else
-        moveFrame:Hide()
-    end
-end
-
 local function CreateBar()
     bar = CreateFrame("Frame", nil, UIParent)
     bar:SetSize(db.width, db.height)
@@ -460,7 +492,19 @@ local function CreateBar()
     bar:SetFrameLevel(100)
     bar:SetClampedToScreen(true)
     bar:SetMovable(true)
+    bar:SetResizable(true)
+    bar:SetResizeBounds(120, 15, 852, 60)
     bar:SetAlpha(db.alpha)
+
+    if bar.SetMouseMotionEnabled then
+        bar:SetMouseMotionEnabled(true)
+    else
+        bar:EnableMouse(true)
+    end
+    if bar.SetMouseClickEnabled then
+        bar:SetMouseClickEnabled(false)
+    end
+    clickEnabled = false
 
     local background = bar:CreateTexture(nil, "BACKGROUND")
     background:SetAtlas("ui-swingtimerbar-background")
@@ -499,42 +543,99 @@ local function CreateBar()
     ApplyStyle()
     UpdateShadowWidth()
 
-    moveFrame = CreateFrame("Frame", nil, bar, "BackdropTemplate")
-    moveFrame:SetAllPoints(bar)
-    moveFrame:SetFrameLevel(bar:GetFrameLevel() + 10)
-    moveFrame:SetBackdrop({
+    highlight = CreateFrame("Frame", nil, bar, "BackdropTemplate")
+    highlight:SetAllPoints(bar)
+    highlight:SetFrameLevel(bar:GetFrameLevel() + 5)
+    highlight:SetBackdrop({
         edgeFile = "Interface\\Buttons\\WHITE8X8",
         edgeSize = 1,
     })
-    moveFrame:SetBackdropBorderColor(1, 0.82, 0, 1)
-    moveFrame:Hide()
+    highlight:SetBackdropBorderColor(1, 0.82, 0, 1)
+    highlight:Hide()
 
-    local moveText = moveFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    moveText:SetPoint("BOTTOM", moveFrame, "TOP", 0, 4)
-    moveText:SetText("Drag to move  -  /gcd to lock")
-    moveText:SetTextColor(1, 0.82, 0, 1)
+    grip = CreateFrame("Button", nil, bar)
+    grip:SetSize(16, 16)
+    grip:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT", 4, -4)
+    grip:SetFrameLevel(bar:GetFrameLevel() + 20)
+    grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    grip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+    grip:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
 
-    bar:SetScript("OnDragStart", function(self)
-        if db.locked then
-            return
-        end
-        self:StartMoving()
+    local normalTexture = grip:GetNormalTexture()
+    if normalTexture then
+        normalTexture:SetVertexColor(1, 0.82, 0, 1)
+    end
+    local pushedTexture = grip:GetPushedTexture()
+    if pushedTexture then
+        pushedTexture:SetVertexColor(1, 0.82, 0, 1)
+    end
+
+    grip:EnableMouse(true)
+    grip:Hide()
+
+    bar:SetScript("OnEnter", function()
+        hovered = true
     end)
 
-    bar:SetScript("OnDragStop", function(self)
-        self:StopMovingOrSizing()
+    bar:SetScript("OnLeave", function()
+        if not grip:IsMouseOver() then
+            hovered = false
+        end
+    end)
 
-        local point, _, relativePoint, x, y = self:GetPoint(1)
-        db.point = point
-        db.relativePoint = relativePoint
-        db.x = x
-        db.y = y
+    grip:SetScript("OnEnter", function()
+        hovered = true
+    end)
+
+    grip:SetScript("OnLeave", function()
+        if not bar:IsMouseOver() then
+            hovered = false
+        end
+    end)
+
+    bar:SetScript("OnSizeChanged", function(_, width, height)
+        db.width = width
+        db.height = height
+        UpdateShadowWidth()
+    end)
+
+    bar:SetScript("OnMouseDown", function(_, button)
+        if button ~= "LeftButton" or not IsShiftKeyDown() then
+            return
+        end
+        interacting = true
+        bar:StartMoving()
+    end)
+
+    bar:SetScript("OnMouseUp", function(_, button)
+        if button ~= "LeftButton" then
+            return
+        end
+        bar:StopMovingOrSizing()
+        SavePosition()
+        interacting = false
+    end)
+
+    grip:SetScript("OnMouseDown", function(_, button)
+        if button ~= "LeftButton" or not IsShiftKeyDown() then
+            return
+        end
+        interacting = true
+        bar:StartSizing("BOTTOMRIGHT")
+    end)
+
+    grip:SetScript("OnMouseUp", function(_, button)
+        if button ~= "LeftButton" then
+            return
+        end
+        bar:StopMovingOrSizing()
+        SavePosition()
+        interacting = false
     end)
 
     bar:SetScript("OnUpdate", OnUpdate)
 
     ApplyPosition()
-    SetMoveMode(not db.locked)
 end
 
 local function ResetSettings()
@@ -547,21 +648,32 @@ local function ResetSettings()
     db.relativePoint = DEFAULTS.relativePoint
     db.x = DEFAULTS.x
     db.y = DEFAULTS.y
-    db.locked = true
+    db.locked = nil
+    interacting = false
 
     ApplySize()
     bar:SetScale(db.scale)
     bar:SetAlpha(db.alpha)
     ApplyStyle()
     ApplyPosition()
-    SetMoveMode(false)
     ClearGCD()
+
+    if grip then
+        grip:Hide()
+    end
+    if highlight then
+        highlight:Hide()
+    end
+    clickEnabled = false
+    if bar.SetMouseClickEnabled then
+        bar:SetMouseClickEnabled(false)
+    end
 end
 
 local function PrintHelp()
+    Print("shift-drag the bar to move it.")
+    Print("hold shift and hover the bottom-right corner to resize it.")
     Print("commands:")
-    Print("  /gcd - toggle move mode")
-    Print("  /gcd lock - lock the bar")
     Print("  /gcd reset - reset position, size, and style")
     Print("  /gcd width <120-852> - set width")
     Print("  /gcd height <15-60> - set height")
@@ -615,19 +727,10 @@ local function HandleCommand(message)
     command = (command or ""):lower()
     rest = rest:match("^%s*(.-)%s*$") or rest
 
-    if command == "" then
-        SetMoveMode(db.locked)
-        if db.locked then
-            Print("locked.")
-        else
-            Print("move mode on - drag the bar, then /gcd to lock.")
-        end
-    elseif command == "move" or command == "unlock" then
-        SetMoveMode(true)
-        Print("move mode on - drag the bar, then /gcd to lock.")
-    elseif command == "lock" then
-        SetMoveMode(false)
-        Print("locked.")
+    if command == "" or command == "help" then
+        PrintHelp()
+    elseif command == "move" or command == "unlock" or command == "lock" then
+        Print("shift-drag the bar to move it; no unlock is needed.")
     elseif command == "reset" then
         ResetSettings()
         Print("position, size, and style reset.")
@@ -735,6 +838,14 @@ events:SetScript("OnEvent", function(self, event, ...)
             db.customColor = nil
         end
         db.version = DB_VERSION
+        db.locked = nil
+        db.width = math.max(120, math.min(852, tonumber(db.width) or DEFAULTS.width))
+        db.height = math.max(15, math.min(60, tonumber(db.height) or DEFAULTS.height))
+        db.scale = math.max(0.5, math.min(2, tonumber(db.scale) or DEFAULTS.scale))
+        db.alpha = math.max(0.1, math.min(1, tonumber(db.alpha) or DEFAULTS.alpha))
+        if not STYLE_TEXTURES[db.style] then
+            db.style = DEFAULTS.style
+        end
 
         local firstRun = db.welcomed ~= true
         db.welcomed = true
@@ -743,7 +854,7 @@ events:SetScript("OnEvent", function(self, event, ...)
         self:UnregisterEvent("ADDON_LOADED")
 
         if firstRun then
-            Print("loaded. Type /gcd to move the bar, or /gcd test to preview it.")
+            Print("loaded. Shift-drag to move; Shift-hover the bottom-right corner to resize.")
         end
     elseif event == "PLAYER_ENTERING_WORLD" then
         ClearGCD()

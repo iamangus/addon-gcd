@@ -9,7 +9,8 @@ built-in main-hand, off-hand, and ranged swing timers.
 - Three fill styles: main hand, off hand, or ranged.
 - Remaining-time readout, like the swing timers.
 - Position, size, scale, opacity, and style are saved per account.
-- Click-through while locked.
+- Shift-drag to move; hold Shift while hovering to reveal the resize grip.
+- Click-through when you are not holding Shift.
 - Uses the same GCD signals as Blizzard's own Cooldown Viewer.
 
 ## Install with WowUp
@@ -43,10 +44,18 @@ selects it for the Forever client.
 
 ## Usage
 
+No unlock or lock mode is needed.
+
+- **Move:** hold `Shift` and drag the bar.
+- **Resize:** hold `Shift` while hovering over the bar. A resize grip appears in
+  the bottom-right corner; drag it.
+- Without `Shift`, the bar is click-through.
+
+The commands are optional:
+
 | Command | What it does |
 | --- | --- |
-| `/gcd` | Toggle move mode. Drag the bar, then use `/gcd` again to lock it. |
-| `/gcd lock` | Lock the bar and make it click-through. |
+| `/gcd` | Show the interaction hint and command list. |
 | `/gcd reset` | Reset position, size, scale, opacity, and style. |
 | `/gcd width <120-852>` | Set the bar width in pixels. |
 | `/gcd height <15-60>` | Set the bar height in pixels. |
@@ -89,8 +98,8 @@ estimate. The bar keeps working in combat and in instances.
 The addon lives in `GCDBar/`. The release workflow runs on tags matching `v*`:
 
 ```sh
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
 It copies `GCDBar/`, writes the tag version into both TOC files, zips it as
