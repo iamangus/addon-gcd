@@ -181,6 +181,7 @@ local function CreateBar()
     bar = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
     bar:SetSize(db.width, db.height)
     bar:SetFrameStrata("MEDIUM")
+    bar:SetFrameLevel(100)
     bar:SetClampedToScreen(true)
     bar:SetMovable(true)
     bar:SetBackdrop({
