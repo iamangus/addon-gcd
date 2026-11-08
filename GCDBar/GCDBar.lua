@@ -80,6 +80,10 @@ local playerCastWindowEnd = 0
 local lastEventSpellID
 local lastEventRecovery
 local lastEventAccepted = false
+local lastUnitSpellEventUnit
+local lastUnitSpellEventSpellID
+local lastStartSource
+local lastStartSpellID
 
 local function IsSecret(value)
     return type(issecretvalue) == "function" and issecretvalue(value) or false
@@ -273,23 +277,33 @@ local function GetCooldownInfo(spellID)
     return C_Spell.GetSpellCooldown(safeSpellID)
 end
 
-local function IsKnownPlayerSpell(spellID)
-    if not spellID then
+local function IsAutoAttackSpell(spellID)
+    if not spellID or type(C_Spell) ~= "table" then
         return false
     end
 
-    if spellID == lastSpellID and GetTime() <= playerCastWindowEnd then
-        return true
+    if type(C_Spell.IsAutoAttackSpell) == "function" then
+        local ok, isAutoAttack = pcall(C_Spell.IsAutoAttackSpell, spellID)
+        if ok and isAutoAttack then
+            return true
+        end
     end
 
-    if type(C_SpellBook) == "table" and type(C_SpellBook.FindSpellBookSlotForSpell) == "function" then
-        local ok, slot = pcall(C_SpellBook.FindSpellBookSlotForSpell, spellID)
-        if ok and slot ~= nil then
+    if type(C_Spell.IsRangedAutoAttackSpell) == "function" then
+        local ok, isRangedAutoAttack = pcall(C_Spell.IsRangedAutoAttackSpell, spellID)
+        if ok and isRangedAutoAttack then
             return true
         end
     end
 
     return false
+end
+
+local function IsRecentPlayerSpell(spellID)
+    return spellID ~= nil
+        and spellID == lastSpellID
+        and GetTime() <= playerCastWindowEnd
+        and not IsAutoAttackSpell(spellID)
 end
 
 local function StartGCDFromRemaining(remaining, fromFallback)
@@ -436,6 +450,8 @@ local function TryStartGCD(spellID, fromEvent)
     if info then
         local remaining = SafeValue(info.timeUntilEndOfStartRecovery)
         if type(remaining) == "number" and remaining > 0 then
+            lastStartSource = fromEvent and "event" or "poll"
+            lastStartSpellID = spellID
             return StartGCDFromRemaining(remaining, false)
         end
 
@@ -444,6 +460,8 @@ local function TryStartGCD(spellID, fromEvent)
             local duration = SafeValue(info.duration)
             if type(startTime) == "number" and type(duration) == "number"
                 and duration > 0 and duration <= MAX_GCD_DURATION then
+                lastStartSource = fromEvent and "event" or "poll"
+                lastStartSpellID = spellID
                 return StartGCDFromTimes(startTime, duration)
             end
         end
@@ -452,6 +470,8 @@ local function TryStartGCD(spellID, fromEvent)
     if fromEvent then
         -- The event says the GCD started, but the cooldown fields are not
         -- available. Fall back to the last observed or hasted base GCD.
+        lastStartSource = "event-fallback"
+        lastStartSpellID = spellID
         return StartGCDFromRemaining(GetFallbackGCDDuration(), true)
     end
 
@@ -476,6 +496,9 @@ local function PollGCD()
     if GetTime() < restartBlockedUntil then
         return
     end
+    if GetTime() > playerCastWindowEnd then
+        return
+    end
 
     local spellID = lastSpellID or lastBaseSpellID
     if not spellID then
@@ -489,6 +512,8 @@ local function PollGCD()
 
     local remaining = SafeValue(info.timeUntilEndOfStartRecovery)
     if type(remaining) == "number" and remaining > 0 then
+        lastStartSource = "poll"
+        lastStartSpellID = spellID
         StartGCDFromRemaining(remaining)
         return
     end
@@ -498,6 +523,8 @@ local function PollGCD()
         local duration = SafeValue(info.duration)
         if type(startTime) == "number" and type(duration) == "number"
             and duration > 0 and duration <= MAX_GCD_DURATION then
+            lastStartSource = "poll"
+            lastStartSpellID = spellID
             StartGCDFromTimes(startTime, duration)
         end
     end
@@ -526,6 +553,8 @@ local function StartTest()
     gcdFromFallback = false
     gcdDuration = 1.5
     gcdEndTime = now + 1.5
+    lastStartSource = "test"
+    lastStartSpellID = nil
 
     status:SetMinMaxValues(0, 1)
     status:SetValue(0)
@@ -779,9 +808,13 @@ end
 
 local function PrintDebug()
     Print("in combat: " .. tostring(InCombatLockdown()))
+    Print("last unit event: " .. tostring(lastUnitSpellEventUnit)
+        .. " spell: " .. Describe(lastUnitSpellEventSpellID))
     Print("last event spell: " .. Describe(lastEventSpellID)
         .. " recovery: " .. Describe(lastEventRecovery)
         .. " accepted: " .. tostring(lastEventAccepted))
+    Print("last start: " .. tostring(lastStartSource)
+        .. " spell: " .. Describe(lastStartSpellID))
     Print("last player spell: " .. Describe(lastSpellID)
         .. " base: " .. Describe(lastBaseSpellID)
         .. " category: " .. Describe(lastCategory)
@@ -927,7 +960,8 @@ local function OnSpellUpdateCooldown(spellID, baseSpellID, category, startRecove
 
     -- SPELL_UPDATE_COOLDOWN is global, so pet spells arrive here too. Only
     -- accept the player's own spells, or an item use (pets do not use items).
-    local isPlayer = safeItemID ~= nil or IsKnownPlayerSpell(candidate)
+    local isPlayer = safeItemID ~= nil
+        or (candidate ~= nil and not IsAutoAttackSpell(candidate) and IsRecentPlayerSpell(candidate))
     lastEventAccepted = isPlayer
 
     if not isPlayer then
@@ -1005,9 +1039,11 @@ events:SetScript("OnEvent", function(self, event, ...)
     elseif event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_SUCCEEDED"
         or event == "UNIT_SPELLCAST_CHANNEL_START" then
         local unit, _, spellID = ...
+        lastUnitSpellEventUnit = unit
+        lastUnitSpellEventSpellID = SafeValue(spellID)
         if unit == "player" or unit == "vehicle" then
             local safeSpellID = SafeValue(spellID)
-            if safeSpellID then
+            if safeSpellID and not IsAutoAttackSpell(safeSpellID) then
                 lastSpellID = safeSpellID
                 playerCastWindowEnd = GetTime() + 0.75
             end
