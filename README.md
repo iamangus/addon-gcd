@@ -10,7 +10,7 @@ built-in main-hand, off-hand, and ranged swing timers.
 - Remaining-time readout, like the swing timers.
 - Position, size, scale, opacity, and style are saved per account.
 - Click-through while locked.
-- Keeps working in combat by reading the never-secret GCD dummy spell.
+- Uses the same GCD signals as Blizzard's own Cooldown Viewer.
 
 ## Install with WowUp
 
@@ -62,19 +62,21 @@ use `/gcd opacity 50` if you want them to match exactly.
 
 ## How it works
 
-The GCD is read from spell `61304`, Blizzard's dummy Global Cooldown spell.
-That spell is on Blizzard's never-secret cooldown whitelist, so the addon can
-read its start time and duration even in combat.
+Forever does not expose the old spell `61304` dummy GCD, so the addon uses the
+same signals as Blizzard's Cooldown Viewer:
 
-The bar polls that cooldown on a short ticker instead of relying only on
-`SPELL_UPDATE_COOLDOWN` timing, then animates exactly like Blizzard's swing
-timer: the bar fills from 0 to 1 while the time label counts down. The
-background, border, fill, pip, and label atlases are the same ones used by
-`Blizzard_SwingTimer`.
+- `SPELL_UPDATE_COOLDOWN` reports `startRecoveryCategory == 133` when the GCD
+  begins.
+- The cast spell's `timeUntilEndOfStartRecovery` field is the remaining GCD.
 
-If a client ever marks those values secret, the addon falls back to
-`C_Spell.GetSpellCooldownDuration` plus `StatusBar:SetTimerDuration` and hides
-the numeric readout.
+A short polling ticker catches the GCD if an event is missed. The bar then
+animates exactly like Blizzard's swing timer: it fills from 0 to 1 while the
+time label counts down. The background, border, fill, pip, and label atlases
+are the same ones used by `Blizzard_SwingTimer`.
+
+If the cooldown fields are unreadable, the addon uses the spell's readable
+start/duration, then the last observed GCD duration, then a hasted base-GCD
+estimate. The bar keeps working in combat and in instances.
 
 ## Compatibility
 
@@ -87,8 +89,8 @@ the numeric readout.
 The addon lives in `GCDBar/`. The release workflow runs on tags matching `v*`:
 
 ```sh
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 It copies `GCDBar/`, writes the tag version into both TOC files, zips it as

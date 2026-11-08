@@ -2,7 +2,7 @@
 ## Title: GCD Bar
 ## Notes: A small movable bar that tracks your global cooldown.
 ## Author: Angus
-## Version: 1.1.0
+## Version: 1.2.0
 ## SavedVariables: GCDBarDB
 ## IconTexture: Interface\AddOns\GCDBar\Media\icon
 ## Category: Combat

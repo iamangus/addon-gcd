@@ -1,10 +1,15 @@
 local addonName = ...
 
--- Blizzard's dummy "Global Cooldown" spell. Its cooldown is whitelisted as
--- never-secret, which lets an addon read the start/duration and animate a bar
--- the same way Blizzard's own swing timers do.
-local GCD_SPELL_ID = 61304
+-- Forever does not expose the old spell 61304 dummy GCD. Instead, use the
+-- same two pieces of information Blizzard's CooldownViewer uses:
+--   1. SPELL_UPDATE_COOLDOWN reports startRecoveryCategory 133 when the GCD begins.
+--   2. SpellCooldownInfo.timeUntilEndOfStartRecovery is the remaining GCD.
+local GLOBAL_RECOVERY_CATEGORY = (Constants
+    and Constants.SpellCooldownConsts
+    and Constants.SpellCooldownConsts.GLOBAL_RECOVERY_CATEGORY) or 133
 local POLL_INTERVAL = 0.05
+local MAX_GCD_DURATION = 2.0
+local GCD_CACHE_TTL = 30
 
 local DEFAULTS = {
     width = 213,
@@ -37,22 +42,30 @@ local timeLabel
 local moveFrame
 
 local gcdActive = false
-local gcdStartTime
 local gcdDuration
 local gcdEndTime
-local useDurationTimer = false
+local gcdFromFallback = false
+local lastKnownGCDDuration
+local lastKnownGCDTime = 0
 local isTest = false
 local restartBlockedUntil = 0
 local pollElapsed = 0
 
-local HAS_DURATION_API = type(C_Spell) == "table"
-    and type(C_Spell.GetSpellCooldownDuration) == "function"
-
-local INTERPOLATION = (Enum and Enum.StatusBarInterpolation and Enum.StatusBarInterpolation.Immediate) or 0
-local ELAPSED_DIRECTION = (Enum and Enum.StatusBarTimerDirection and Enum.StatusBarTimerDirection.ElapsedTime) or 0
+local lastSpellID
+local lastBaseSpellID
+local lastCategory
+local lastStartRecoveryCategory
+local lastItemID
 
 local function IsSecret(value)
     return type(issecretvalue) == "function" and issecretvalue(value) or false
+end
+
+local function SafeValue(value)
+    if IsSecret(value) then
+        return nil
+    end
+    return value
 end
 
 local function Describe(value)
@@ -125,18 +138,16 @@ end
 
 local function ClearGCD()
     gcdActive = false
-    useDurationTimer = false
     isTest = false
-    gcdStartTime = nil
     gcdDuration = nil
     gcdEndTime = nil
+    gcdFromFallback = false
     restartBlockedUntil = GetTime() + POLL_INTERVAL
 
     if not status then
         return
     end
 
-    -- Removing the range also removes any duration-object timer.
     status:SetMinMaxValues(0, 1)
     status:SetValue(0)
 
@@ -149,91 +160,64 @@ local function ClearGCD()
     end
 end
 
-local function GetGCDInfo()
-    if type(C_Spell) ~= "table" or type(C_Spell.GetSpellCooldown) ~= "function" then
+local function GetCooldownInfo(spellID)
+    local safeSpellID = SafeValue(spellID)
+    if not safeSpellID or type(C_Spell) ~= "table" or type(C_Spell.GetSpellCooldown) ~= "function" then
         return nil
     end
-    return C_Spell.GetSpellCooldown(GCD_SPELL_ID)
+    return C_Spell.GetSpellCooldown(safeSpellID)
 end
 
-local function IsGCDActive(info)
-    if not info then
+local function StartGCDFromRemaining(remaining, fromFallback)
+    remaining = SafeValue(remaining)
+    if type(remaining) ~= "number" or remaining <= 0 then
         return false
     end
 
-    if info.isActive ~= nil then
-        return info.isActive
-    end
-
-    local duration = info.duration
-    if duration ~= nil and not IsSecret(duration) then
-        return duration > 0
-    end
-
-    return false
-end
-
-local function StartGCDDuration()
-    if not HAS_DURATION_API or type(status.SetTimerDuration) ~= "function" then
-        return false
-    end
-
-    local durationObject = C_Spell.GetSpellCooldownDuration(GCD_SPELL_ID)
-    if not durationObject then
-        return false
-    end
+    local now = GetTime()
+    gcdActive = true
+    isTest = false
+    gcdFromFallback = fromFallback == true
+    gcdDuration = remaining
+    gcdEndTime = now + remaining
+    lastKnownGCDDuration = remaining
+    lastKnownGCDTime = now
 
     status:SetMinMaxValues(0, 1)
-    local ok = pcall(status.SetTimerDuration, status, durationObject, INTERPOLATION, ELAPSED_DIRECTION)
-    if not ok then
-        return false
-    end
-
-    gcdActive = true
-    useDurationTimer = true
-    isTest = false
-    gcdStartTime = nil
-    gcdDuration = nil
-    gcdEndTime = nil
-
+    status:SetValue(0)
     if pip then
         pip:Show()
     end
     if timeLabel then
-        -- Duration objects cannot be read, so there is no number to show.
-        timeLabel:Hide()
+        timeLabel:Show()
+        timeLabel:SetFormattedText("%.1f", remaining)
     end
     return true
 end
 
-local function StartGCD(info)
-    if not info then
-        return false
-    end
-
-    local startTime, duration = info.startTime, info.duration
-    if IsSecret(startTime) or IsSecret(duration) then
-        return StartGCDDuration()
-    end
-
-    if not startTime or not duration or duration <= 0 then
+local function StartGCDFromTimes(startTime, duration)
+    startTime = SafeValue(startTime)
+    duration = SafeValue(duration)
+    if type(startTime) ~= "number" or type(duration) ~= "number" or duration <= 0 then
         return false
     end
 
     local endTime = startTime + duration
-    if endTime <= GetTime() then
+    local now = GetTime()
+    if endTime <= now then
         return false
     end
 
     gcdActive = true
-    useDurationTimer = false
     isTest = false
-    gcdStartTime = startTime
+    gcdFromFallback = false
     gcdDuration = duration
     gcdEndTime = endTime
+    lastKnownGCDDuration = duration
+    lastKnownGCDTime = now
 
+    local remaining = endTime - now
     status:SetMinMaxValues(0, 1)
-    local remaining = math.max(0, gcdEndTime - GetTime())
     status:SetValue(math.max(0, math.min(1, (duration - remaining) / duration)))
     if pip then
         pip:Show()
@@ -245,31 +229,168 @@ local function StartGCD(info)
     return true
 end
 
-local function PollGCD(force)
-    if not bar then
+local function RefineGCD(remaining)
+    remaining = SafeValue(remaining)
+    if type(remaining) ~= "number" or remaining <= 0 or not gcdDuration or not gcdEndTime then
+        return false
+    end
+
+    local now = GetTime()
+    local elapsed = now - (gcdEndTime - gcdDuration)
+    local total = elapsed + remaining
+    if total <= 0 then
+        return false
+    end
+
+    gcdDuration = total
+    gcdEndTime = now + remaining
+    gcdFromFallback = false
+    lastKnownGCDDuration = total
+    lastKnownGCDTime = now
+
+    status:SetValue(math.max(0, math.min(1, elapsed / total)))
+    if timeLabel then
+        timeLabel:SetFormattedText("%.1f", remaining)
+    end
+    return true
+end
+
+local function GetFallbackGCDDuration()
+    if type(lastKnownGCDDuration) == "number"
+        and lastKnownGCDDuration >= 0.5 and lastKnownGCDDuration <= MAX_GCD_DURATION
+        and (GetTime() - lastKnownGCDTime) <= GCD_CACHE_TTL then
+        return lastKnownGCDDuration
+    end
+
+    local energy = (Enum and Enum.PowerType and Enum.PowerType.Energy) or 3
+    local powerType = SafeValue(UnitPowerType("player"))
+    if powerType == energy then
+        return 1.0
+    end
+
+    local haste = SafeValue(UnitSpellHaste("player"))
+    if type(haste) ~= "number" then
+        haste = 0
+    end
+
+    return math.max(0.75, 1.5 / (1 + haste / 100))
+end
+
+local function TryStartGCD(spellID, fromEvent)
+    if fromEvent and not spellID and not lastSpellID and not lastBaseSpellID and not lastItemID then
+        -- Ignore cooldown initialization with no associated cast.
+        return false
+    end
+
+    if gcdActive then
+        if isTest then
+            if not fromEvent then
+                return false
+            end
+            -- A real GCD cancels the preview.
+            isTest = false
+            gcdActive = false
+        elseif gcdFromFallback and fromEvent then
+            -- The first event had no readable timing. If a later event does,
+            -- replace the estimate with the real remaining GCD.
+            local info = GetCooldownInfo(spellID)
+            local remaining = info and SafeValue(info.timeUntilEndOfStartRecovery)
+            if type(remaining) == "number" and remaining > 0 then
+                return RefineGCD(remaining)
+            end
+            return false
+        else
+            return false
+        end
+    end
+
+    if GetTime() < restartBlockedUntil then
+        return false
+    end
+
+    local info = GetCooldownInfo(spellID)
+    if info then
+        local remaining = SafeValue(info.timeUntilEndOfStartRecovery)
+        if type(remaining) == "number" and remaining > 0 then
+            return StartGCDFromRemaining(remaining, false)
+        end
+
+        if info.isOnGCD == true then
+            local startTime = SafeValue(info.startTime)
+            local duration = SafeValue(info.duration)
+            if type(startTime) == "number" and type(duration) == "number"
+                and duration > 0 and duration <= MAX_GCD_DURATION then
+                return StartGCDFromTimes(startTime, duration)
+            end
+        end
+    end
+
+    if fromEvent then
+        -- The event says the GCD started, but the cooldown fields are not
+        -- available. Fall back to the last observed or hasted base GCD.
+        return StartGCDFromRemaining(GetFallbackGCDDuration(), true)
+    end
+
+    return false
+end
+
+local function PollGCD()
+    if gcdActive then
+        if gcdFromFallback then
+            local info = GetCooldownInfo(lastSpellID or lastBaseSpellID)
+            local remaining = info and SafeValue(info.timeUntilEndOfStartRecovery)
+            if type(remaining) == "number" and remaining > 0 then
+                RefineGCD(remaining)
+            end
+        end
         return
     end
 
-    local info = GetGCDInfo()
-    local active = IsGCDActive(info)
-
     if isTest then
-        if active then
-            -- A real GCD interrupted the preview.
-            isTest = false
-            gcdActive = false
-        else
-            return
-        end
+        return
+    end
+    if GetTime() < restartBlockedUntil then
+        return
     end
 
-    if active then
-        if not gcdActive and (force or GetTime() >= restartBlockedUntil) then
-            if not StartGCD(info) then
-                ClearGCD()
-            end
+    local spellID = lastSpellID or lastBaseSpellID
+    if not spellID then
+        return
+    end
+
+    local info = GetCooldownInfo(spellID)
+    if not info then
+        return
+    end
+
+    local remaining = SafeValue(info.timeUntilEndOfStartRecovery)
+    if type(remaining) == "number" and remaining > 0 then
+        StartGCDFromRemaining(remaining)
+        return
+    end
+
+    if info.isOnGCD == true then
+        local startTime = SafeValue(info.startTime)
+        local duration = SafeValue(info.duration)
+        if type(startTime) == "number" and type(duration) == "number"
+            and duration > 0 and duration <= MAX_GCD_DURATION then
+            StartGCDFromTimes(startTime, duration)
         end
-    elseif gcdActive then
+    end
+end
+
+local function CheckGCDEnd()
+    if not gcdActive or isTest then
+        return
+    end
+
+    local info = GetCooldownInfo(lastSpellID or lastBaseSpellID)
+    if not info then
+        return
+    end
+
+    local remaining = SafeValue(info.timeUntilEndOfStartRecovery)
+    if type(remaining) == "number" and remaining <= 0 then
         ClearGCD()
     end
 end
@@ -278,8 +399,7 @@ local function StartTest()
     local now = GetTime()
     isTest = true
     gcdActive = true
-    useDurationTimer = false
-    gcdStartTime = now
+    gcdFromFallback = false
     gcdDuration = 1.5
     gcdEndTime = now + 1.5
 
@@ -298,10 +418,10 @@ local function OnUpdate(_, elapsed)
     pollElapsed = pollElapsed + elapsed
     if pollElapsed >= POLL_INTERVAL then
         pollElapsed = 0
-        PollGCD(false)
+        PollGCD()
     end
 
-    if not gcdActive or useDurationTimer or not gcdEndTime then
+    if not gcdActive or not gcdEndTime then
         return
     end
 
@@ -342,7 +462,6 @@ local function CreateBar()
     bar:SetMovable(true)
     bar:SetAlpha(db.alpha)
 
-    -- The same atlas art as Blizzard's swing timers.
     local background = bar:CreateTexture(nil, "BACKGROUND")
     background:SetAtlas("ui-swingtimerbar-background")
     background:SetAllPoints(bar)
@@ -463,26 +582,27 @@ end
 
 local function PrintDebug()
     Print("in combat: " .. tostring(InCombatLockdown()))
+    Print("last spell: " .. Describe(lastSpellID)
+        .. " base: " .. Describe(lastBaseSpellID)
+        .. " category: " .. Describe(lastCategory)
+        .. " startRecovery: " .. Describe(lastStartRecoveryCategory)
+        .. " item: " .. Describe(lastItemID))
+    Print("global recovery category: " .. tostring(GLOBAL_RECOVERY_CATEGORY))
 
-    local info = GetGCDInfo()
+    local info = GetCooldownInfo(lastSpellID or lastBaseSpellID)
     if info then
         Print("start=" .. Describe(info.startTime)
             .. " duration=" .. Describe(info.duration)
             .. " active=" .. Describe(info.isActive)
-            .. " onGCD=" .. Describe(info.isOnGCD))
+            .. " onGCD=" .. Describe(info.isOnGCD)
+            .. " startRecovery=" .. Describe(info.timeUntilEndOfStartRecovery))
     else
-        Print("C_Spell.GetSpellCooldown(61304) returned nil")
+        Print("no cooldown info for the last spell")
     end
 
-    local durationObject = HAS_DURATION_API and C_Spell.GetSpellCooldownDuration(GCD_SPELL_ID)
-    Print("duration object: " .. tostring(durationObject ~= nil))
-
-    if C_Secrets and C_Secrets.ShouldSpellCooldownBeSecret then
-        local ok, secret = pcall(C_Secrets.ShouldSpellCooldownBeSecret, GCD_SPELL_ID)
-        Print("cooldown secret: " .. (ok and Describe(secret) or "error"))
-    end
-
-    Print("tracking: " .. tostring(gcdActive) .. ", duration timer: " .. tostring(useDurationTimer))
+    Print("tracking: " .. tostring(gcdActive)
+        .. " fallback: " .. tostring(gcdFromFallback)
+        .. " known GCD: " .. Describe(lastKnownGCDDuration))
 end
 
 local function HandleCommand(message)
@@ -569,16 +689,36 @@ SLASH_GCDBAR1 = "/gcd"
 SLASH_GCDBAR2 = "/gcdbar"
 SlashCmdList.GCDBAR = HandleCommand
 
+local function OnSpellUpdateCooldown(spellID, baseSpellID, category, startRecoveryCategory, itemID)
+    local safeSpellID = SafeValue(spellID)
+    local safeBaseSpellID = SafeValue(baseSpellID)
+    local recovery = SafeValue(startRecoveryCategory)
+
+    lastSpellID = safeSpellID or safeBaseSpellID or lastSpellID
+    lastBaseSpellID = safeBaseSpellID or lastBaseSpellID
+    lastCategory = SafeValue(category)
+    lastStartRecoveryCategory = recovery
+    lastItemID = SafeValue(itemID)
+
+    if recovery == GLOBAL_RECOVERY_CATEGORY then
+        TryStartGCD(lastSpellID, true)
+    end
+end
+
 local events = CreateFrame("Frame")
 events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_ENTERING_WORLD")
 events:RegisterEvent("SPELL_UPDATE_COOLDOWN")
+events:RegisterEvent("UNIT_SPELLCAST_START")
+events:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
+events:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
 events:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
 events:RegisterEvent("UNIT_SPELLCAST_FAILED")
 
-events:SetScript("OnEvent", function(self, event, arg1)
+events:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
-        if arg1 ~= addonName then
+        local loadedAddon = ...
+        if loadedAddon ~= addonName then
             return
         end
 
@@ -608,10 +748,20 @@ events:SetScript("OnEvent", function(self, event, arg1)
     elseif event == "PLAYER_ENTERING_WORLD" then
         ClearGCD()
     elseif event == "SPELL_UPDATE_COOLDOWN" then
-        PollGCD(true)
+        OnSpellUpdateCooldown(...)
+    elseif event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_SUCCEEDED"
+        or event == "UNIT_SPELLCAST_CHANNEL_START" then
+        local unit, _, spellID = ...
+        if unit == "player" then
+            local safeSpellID = SafeValue(spellID)
+            if safeSpellID then
+                lastSpellID = safeSpellID
+            end
+        end
     elseif event == "UNIT_SPELLCAST_INTERRUPTED" or event == "UNIT_SPELLCAST_FAILED" then
-        if arg1 == "player" then
-            PollGCD(true)
+        local unit = ...
+        if unit == "player" then
+            CheckGCDEnd()
         end
     end
 end)
