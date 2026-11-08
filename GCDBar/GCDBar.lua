@@ -17,6 +17,7 @@ local DEFAULTS = {
     scale = 1,
     alpha = 1,
     style = "mainhand",
+    anchor = "none",
     point = "CENTER",
     relativePoint = "CENTER",
     x = 0,
@@ -30,6 +31,21 @@ local STYLE_TEXTURES = {
     offhand = "ui-swingtimerbar-filling-offhand",
     ranged = "ui-swingtimerbar-filling-ranged",
 }
+
+local SWING_TIMER_FRAMES = {
+    mainhand = "SwingTimerMainHandFrame",
+    offhand = "SwingTimerOffHandFrame",
+    ranged = "SwingTimerRangedFrame",
+}
+
+local ANCHOR_ALIASES = {
+    main = "mainhand",
+    off = "offhand",
+    range = "ranged",
+    free = "none",
+}
+
+local hookedSwingTimers = {}
 
 local db
 local bar
@@ -100,25 +116,63 @@ local function CopyDefaults(destination, source)
     end
 end
 
+local UpdateShadowWidth
+
+local function GetAnchorFrame()
+    if not db or not db.anchor or db.anchor == "none" then
+        return nil
+    end
+
+    local frameName = SWING_TIMER_FRAMES[db.anchor]
+    return frameName and _G[frameName] or nil
+end
+
+local function HookSwingTimer(frame)
+    if hookedSwingTimers[frame] then
+        return
+    end
+    hookedSwingTimers[frame] = true
+
+    frame:HookScript("OnSizeChanged", function()
+        if GetAnchorFrame() == frame and bar then
+            bar:SetHeight(math.max(15, math.min(60, frame:GetHeight())))
+        end
+    end)
+end
+
 local function ApplyPosition()
     if not bar then
         return
     end
 
     bar:ClearAllPoints()
-    bar:SetPoint(
-        db.point or DEFAULTS.point,
-        UIParent,
-        db.relativePoint or db.point or DEFAULTS.relativePoint,
-        db.x or 0,
-        db.y or 0
-    )
+
+    local anchorFrame = GetAnchorFrame()
+    if anchorFrame then
+        bar:SetPoint("BOTTOMLEFT", anchorFrame, "TOPLEFT", 0, 1)
+        bar:SetPoint("BOTTOMRIGHT", anchorFrame, "TOPRIGHT", 0, 1)
+        bar:SetHeight(math.max(15, math.min(60, anchorFrame:GetHeight())))
+        HookSwingTimer(anchorFrame)
+    else
+        bar:SetPoint(
+            db.point or DEFAULTS.point,
+            UIParent,
+            db.relativePoint or db.point or DEFAULTS.relativePoint,
+            db.x or 0,
+            db.y or 0
+        )
+    end
+
+    UpdateShadowWidth()
 end
 
-local function UpdateShadowWidth()
-    if typeLabelShadow then
-        typeLabelShadow:SetWidth(math.min(171, math.max(1, (db.width or DEFAULTS.width) - 12)))
+function UpdateShadowWidth()
+    if not typeLabelShadow then
+        return
     end
+
+    local width = (bar and bar:GetWidth()) or db.width or DEFAULTS.width
+    typeLabelShadow:SetWidth(math.min(171, math.max(1, width - 12)))
 end
 
 local function ApplyStyle()
@@ -163,8 +217,9 @@ local function UpdateInteraction()
 
     local over = hovered or bar:IsMouseOver() or status:IsMouseOver() or grip:IsMouseOver()
     local shift = over and IsShiftKeyDown()
+    local anchored = GetAnchorFrame() ~= nil
 
-    local show = over and shift
+    local show = over and shift and not anchored
     if show and not grip:IsShown() then
         grip:Show()
     elseif not show and grip:IsShown() and not interacting then
@@ -626,6 +681,10 @@ local function CreateBar()
         if button ~= "LeftButton" or not IsShiftKeyDown() then
             return
         end
+        if GetAnchorFrame() then
+            Print("anchored to the " .. db.anchor .. " swing timer; /gcd anchor none to move freely.")
+            return
+        end
         interacting = true
         bar:StartMoving()
     end)
@@ -640,7 +699,7 @@ local function CreateBar()
     end)
 
     grip:SetScript("OnMouseDown", function(_, button)
-        if button ~= "LeftButton" or not IsShiftKeyDown() then
+        if button ~= "LeftButton" or not IsShiftKeyDown() or GetAnchorFrame() then
             return
         end
         interacting = true
@@ -667,6 +726,7 @@ local function ResetSettings()
     db.scale = DEFAULTS.scale
     db.alpha = DEFAULTS.alpha
     db.style = DEFAULTS.style
+    db.anchor = DEFAULTS.anchor
     db.point = DEFAULTS.point
     db.relativePoint = DEFAULTS.relativePoint
     db.x = DEFAULTS.x
@@ -696,8 +756,10 @@ end
 local function PrintHelp()
     Print("shift-drag the bar to move it.")
     Print("hold shift and hover the bottom-right corner to resize it.")
+    Print("or attach it to a built-in swing timer: /gcd anchor mainhand")
     Print("commands:")
-    Print("  /gcd reset - reset position, size, and style")
+    Print("  /gcd anchor <mainhand|offhand|ranged|none> - follow a swing timer")
+    Print("  /gcd reset - reset position, size, anchor, and style")
     Print("  /gcd width <120-852> - set width")
     Print("  /gcd height <15-60> - set height")
     Print("  /gcd scale <0.5-2> - set scale")
@@ -739,6 +801,7 @@ local function PrintDebug()
         Print("no cooldown info for the last spell")
     end
 
+    Print("anchor: " .. tostring(db.anchor) .. " target: " .. tostring(GetAnchorFrame()))
     Print("tracking: " .. tostring(gcdActive)
         .. " fallback: " .. tostring(gcdFromFallback)
         .. " known GCD: " .. Describe(lastKnownGCDDuration))
@@ -760,8 +823,37 @@ local function HandleCommand(message)
         Print("shift-drag the bar to move it; no unlock is needed.")
     elseif command == "reset" then
         ResetSettings()
-        Print("position, size, and style reset.")
+        Print("position, size, anchor, and style reset.")
+    elseif command == "anchor" or command == "snap" then
+        local value = rest:lower()
+        value = ANCHOR_ALIASES[value] or value
+        if value == "" then
+            Print("anchor: " .. (db.anchor or "none"))
+        elseif value == "none" then
+            db.anchor = "none"
+            bar:StopMovingOrSizing()
+            interacting = false
+            ApplyPosition()
+            Print("anchor cleared - shift-drag to move freely.")
+        elseif SWING_TIMER_FRAMES[value] then
+            local frameName = SWING_TIMER_FRAMES[value]
+            if _G[frameName] then
+                db.anchor = value
+                bar:StopMovingOrSizing()
+                interacting = false
+                ApplyPosition()
+                Print("anchored above the " .. value .. " swing timer. Move or resize it in Edit Mode and this bar will follow.")
+            else
+                Print("the " .. value .. " swing timer is not available.")
+            end
+        else
+            Print("usage: /gcd anchor <mainhand|offhand|ranged|none>")
+        end
     elseif command == "width" then
+        if GetAnchorFrame() then
+            Print("width follows the anchored swing timer.")
+            return
+        end
         local width = ParseNumber(rest, 120, 852)
         if width then
             db.width = width
@@ -771,6 +863,10 @@ local function HandleCommand(message)
             Print("usage: /gcd width <120-852>")
         end
     elseif command == "height" then
+        if GetAnchorFrame() then
+            Print("height follows the anchored swing timer.")
+            return
+        end
         local height = ParseNumber(rest, 15, 60)
         if height then
             db.height = height
@@ -888,6 +984,9 @@ events:SetScript("OnEvent", function(self, event, ...)
         if not STYLE_TEXTURES[db.style] then
             db.style = DEFAULTS.style
         end
+        if db.anchor ~= "none" and not SWING_TIMER_FRAMES[db.anchor] then
+            db.anchor = DEFAULTS.anchor
+        end
 
         local firstRun = db.welcomed ~= true
         db.welcomed = true
@@ -896,10 +995,11 @@ events:SetScript("OnEvent", function(self, event, ...)
         self:UnregisterEvent("ADDON_LOADED")
 
         if firstRun then
-            Print("loaded. Shift-drag to move; Shift-hover the bottom-right corner to resize.")
+            Print("loaded. Shift-drag to move, or /gcd anchor mainhand to follow a swing timer.")
         end
     elseif event == "PLAYER_ENTERING_WORLD" then
         ClearGCD()
+        ApplyPosition()
     elseif event == "SPELL_UPDATE_COOLDOWN" then
         OnSpellUpdateCooldown(...)
     elseif event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_SUCCEEDED"
