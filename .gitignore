@@ -1,0 +1,4 @@
+dist/
+*.zip
+release.json
+.DS_Store

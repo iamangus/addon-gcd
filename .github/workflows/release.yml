@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Build the addon zip
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP_NAME="GCDBar-${VERSION}-forever.zip"
+
+          mkdir -p dist
+          cp -R GCDBar dist/GCDBar
+
+          for toc in dist/GCDBar/*.toc; do
+            sed -i "s|^## Version:.*|## Version: ${VERSION}|" "$toc"
+          done
+
+          (cd dist && zip -r "../${ZIP_NAME}" GCDBar)
+
+          jq -n --arg filename "${ZIP_NAME}" '{
+            releases: [{
+              filename: $filename,
+              nolib: false,
+              metadata: [{
+                flavor: "forever",
+                interface: 16001
+              }]
+            }]
+          }' > release.json
+
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "${ZIP_NAME}" release.json \
+            --title "GCD Bar ${VERSION}" \
+            --generate-notes
